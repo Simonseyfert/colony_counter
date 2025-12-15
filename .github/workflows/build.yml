@@ -6,6 +6,9 @@ on:
       - "v*.*.*"
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     strategy:
@@ -46,3 +49,30 @@ jobs:
         with:
           name: ColonyCounter-${{ matrix.os }}
           path: dist/*
+
+      - name: Prepare release assets
+        shell: bash
+        run: |
+          mkdir -p release
+
+          # Windows (.exe)
+          if [ -f "dist/ColonyCounter.exe" ]; then
+            cp "dist/ColonyCounter.exe" "release/ColonyCounter-windows.exe"
+          fi
+
+          # Linux (binary)
+          if [ -f "dist/ColonyCounter" ]; then
+            cp "dist/ColonyCounter" "release/ColonyCounter-linux"
+          fi
+
+          # macOS (.app bundle -> zip)
+          if [ -d "dist/ColonyCounter.app" ]; then
+            ditto -c -k --sequesterRsrc --keepParent \
+              "dist/ColonyCounter.app" "release/ColonyCounter-macos.app.zip"
+          fi
+
+      - name: Upload assets to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
