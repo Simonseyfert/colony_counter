@@ -31,6 +31,17 @@ from openpyxl.drawing.image import Image as XLImage
 
 NUM_CIRCLES = 80  # number of petri dishes (circles)
 
+def app_dir():
+    """
+    Returns the directory of the running app.
+    - When frozen (PyInstaller onefile/onedir): folder containing the .exe
+    - When running as .py: folder containing this script
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
 def extract_plate_warp(img_bgr, W=1200, H=800):
     """
     Replicates your Project-2 preprocessing:
@@ -1580,14 +1591,13 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No wells", "No wells detected yet. Click Preprocess first.")
             return
 
-        # load model (joblib) from same folder as this script
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        model_path = os.path.join(script_dir, "best_model_robust_aug.joblib")
+        # load model (joblib) from same folder as the running app (.exe when frozen)
+        model_path = os.path.join(app_dir(), "best_model_robust_aug.joblib")
         if not os.path.exists(model_path):
             QMessageBox.warning(
                 self,
                 "Missing model",
-                f"Could not find best_model.joblib next to the script:\n{model_path}"
+                f"Could not find best_model_robust_aug.joblib next to the executable/script:\n{model_path}"
             )
             return
 

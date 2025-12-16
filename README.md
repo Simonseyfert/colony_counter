@@ -17,6 +17,11 @@ For questions or issues, feel free to contact:
 
 ---
 
+## How to install
+
+
+## How to run
+
 ## Repository Structure (Preliminary)
 
 ```text
