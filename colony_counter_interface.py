@@ -15,15 +15,180 @@ from PyQt5.QtWidgets import (
     QAction,
     QMessageBox,
     QLineEdit,
+    QSlider,
 )
-from PyQt5.QtGui import QPixmap, QPainter, QPen, QColor
+
+from PyQt5.QtGui import QPixmap, QPainter, QPen, QColor, QImage
 from PyQt5.QtCore import Qt, QRectF, QPointF
 
 import pandas as pd
+import numpy as np
+import cv2
 from openpyxl.drawing.image import Image as XLImage
 
 
 NUM_CIRCLES = 80  # number of petri dishes (circles)
+
+def extract_plate_warp(img_bgr, W=1200, H=800):
+    """
+    Replicates your Project-2 preprocessing:
+    - grayscale -> Otsu -> invert -> morphological close
+    - largest contour -> minAreaRect -> perspective warp to (W,H)
+    Returns: warped_bgr
+    """
+    if img_bgr is None:
+        return None
+
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    thresh_inv = cv2.bitwise_not(thresh)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+    morph = cv2.morphologyEx(thresh_inv, cv2.MORPH_CLOSE, kernel)
+
+    contours, _ = cv2.findContours(morph, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    largest = max(contours, key=cv2.contourArea)
+    rect = cv2.minAreaRect(largest)
+    box = cv2.boxPoints(rect).astype(np.int32)
+
+    def order_points(pts):
+        pts = pts.reshape(4, 2).astype(np.float32)
+        s = pts.sum(axis=1)
+        diff = np.diff(pts, axis=1)
+        return np.array([
+            pts[np.argmin(s)],        # top-left
+            pts[np.argmin(diff)],     # top-right
+            pts[np.argmax(s)],        # bottom-right
+            pts[np.argmax(diff)]      # bottom-left
+        ], dtype=np.float32)
+
+    src = order_points(box)
+    dst = np.array([[0, 0], [W - 1, 0], [W - 1, H - 1], [0, H - 1]], dtype=np.float32)
+
+    M = cv2.getPerspectiveTransform(src, dst)
+    warped = cv2.warpPerspective(img_bgr, M, (W, H))
+    return warped
+# ----------------------------
+# Well detection (from Project 2)
+# ----------------------------
+HOUGH_DP, HOUGH_MINDIST = 1.2, 45
+HOUGH_PARAM1, HOUGH_PARAM2 = 80, 25
+HOUGH_MINR, HOUGH_MAXR = 35, 40
+REMOVE_OVERLAP_MINDIST = 60
+
+def detect_wells(img_bgr):
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (9, 9), 2)
+    circles = cv2.HoughCircles(
+        blurred, cv2.HOUGH_GRADIENT,
+        dp=HOUGH_DP, minDist=HOUGH_MINDIST,
+        param1=HOUGH_PARAM1, param2=HOUGH_PARAM2,
+        minRadius=HOUGH_MINR, maxRadius=HOUGH_MAXR
+    )
+    return np.round(circles[0]).astype(int) if circles is not None else None
+
+def remove_overlaps(circles, min_dist=REMOVE_OVERLAP_MINDIST):
+    if circles is None:
+        return None
+    final = []
+    for c in circles:
+        if all(np.hypot(c[0] - f[0], c[1] - f[1]) >= min_dist for f in final):
+            final.append(c)
+    return np.array(final, dtype=int) if len(final) else None
+
+# Drop the outermost columns (like training script)
+DROP_EDGE_COLS = (1, 12)
+
+def label_wells_A1_H12(circles, row_labels="ABCDEFGH"):
+    """Assign approximate A1..H12 based on y-then-x sorting."""
+    if circles is None or len(circles) == 0:
+        return {}
+
+    circles_sorted = sorted(circles, key=lambda c: c[1])  # sort by y
+    rows = [[] for _ in range(8)]
+    row_thresh = 35
+
+    for c in circles_sorted:
+        y = c[1]
+        for row in rows:
+            if (len(row) == 0) or (abs(row[0][1] - y) < row_thresh):
+                row.append(c)
+                break
+
+    for row in rows:
+        row.sort(key=lambda c: c[0])  # sort by x within row
+
+    well_map = {}
+    for i, row in enumerate(rows):
+        for j, c in enumerate(row):
+            well_map[f"{row_labels[i]}{j+1}"] = (int(c[0]), int(c[1]), int(c[2]))
+    return well_map
+
+def remove_edge_columns(well_map, cols=DROP_EDGE_COLS):
+    return {k: v for k, v in well_map.items() if int(k[1:]) not in cols}
+
+def enforce_8x10_row_major(circles_xyz, rows=8, cols=10):
+    """
+    Enforce stable order:
+      - split into 8 rows based on y (robust grouping)
+      - within each row sort by x (left->right)
+      - return exactly up to rows*cols circles in row-major order
+    Also returns synthetic labels: A2..H11 (10 per row).
+    """
+    if not circles_xyz:
+        return [], []
+
+    # sort by y
+    pts = sorted([(int(x), int(y), int(r)) for (x, y, r) in circles_xyz], key=lambda t: t[1])
+
+    # --- robust row grouping ---
+    # 1) estimate 8 row centers using quantiles of y
+    ys = np.array([p[1] for p in pts], dtype=float)
+    # if very few points, fallback to simple ordering
+    if len(ys) < rows:
+        ordered = sorted(pts, key=lambda t: (t[1], t[0]))[: rows * cols]
+        labels = []
+        for ri, row in enumerate("ABCDEFGH"[:rows]):
+            for ci, col in enumerate(range(2, 2 + cols)):
+                labels.append(f"{row}{col}")
+        return ordered, labels[: len(ordered)]
+
+    q = np.linspace(0.05, 0.95, rows)
+    row_centers = np.quantile(ys, q)
+
+    row_bins = [[] for _ in range(rows)]
+    for x, y, r in pts:
+        i = int(np.argmin(np.abs(row_centers - y)))
+        row_bins[i].append((x, y, r))
+
+    # If a row is empty (can happen if detection is messy), fallback to chunking
+    if any(len(rb) == 0 for rb in row_bins):
+        # chunk by y into 8 groups
+        ordered = []
+        chunk = max(1, len(pts) // rows)
+        for i in range(rows):
+            group = pts[i * chunk:(i + 1) * chunk] if i < rows - 1 else pts[i * chunk:]
+            group = sorted(group, key=lambda t: t[0])  # sort x
+            ordered.extend(group[:cols])
+    else:
+        ordered = []
+        for rb in row_bins:
+            rb = sorted(rb, key=lambda t: t[0])  # sort x
+            ordered.extend(rb[:cols])
+
+    ordered = ordered[: rows * cols]
+
+    # A2..H11 labels (10 per row)
+    labels = []
+    for row in "ABCDEFGH"[:rows]:
+        for col in range(2, 2 + cols):  # 2..11 for cols=10
+            labels.append(f"{row}{col}")
+    return ordered, labels[: len(ordered)]
+
 
 
 class ImageViewerModel:
@@ -38,6 +203,10 @@ class ImageViewerModel:
         self._index = -1
         self._predictions = {}  # path -> list[int]
         self._labels = {}       # path -> list[int]
+        self._img_override = {}  # path -> np.ndarray (BGR) for modified images (rotated/warped)
+        self._circles = {}  # path -> list[(x,y,r)] in IMAGE pixel coords
+        self._well_labels = {}  # path -> list[str] (e.g., ["A2","A3",...,"H11"])
+
 
     def set_images(self, paths):
         """Set new list of image paths and clear predictions/labels."""
@@ -45,6 +214,30 @@ class ImageViewerModel:
         self._index = 0 if self._paths else -1
         self._predictions.clear()
         self._labels.clear()
+        self._img_override.clear()
+        self._circles.clear()
+        self._well_labels.clear()
+        
+    def set_well_labels(self, path, labels):
+        if path is None:
+            return
+        self._well_labels[path] = labels or []
+
+    def get_well_labels_for_path(self, path):
+        return self._well_labels.get(path, [])
+
+
+    def set_circles(self, path, circles_xyz):
+        """circles_xyz: list of (x,y,r) ints in image pixel coords."""
+        if path is None:
+            return
+        self._circles[path] = circles_xyz or []
+
+    def get_circles_for_path(self, path):
+        return self._circles.get(path, [])
+
+    def get_circles_for_current(self):
+        return self.get_circles_for_path(self.current_path())
 
     def has_images(self):
         return len(self._paths) > 0
@@ -59,6 +252,27 @@ class ImageViewerModel:
         if not self.has_images():
             return None
         return self._paths[self._index]
+    
+    def get_bgr(self, path):
+        """Return current image pixels for a path: override (if any) else read from disk."""
+        if path is None:
+            return None
+        if path in self._img_override:
+            return self._img_override[path]
+        return cv2.imread(path)
+
+    def set_override(self, path, img_bgr):
+        """Set/replace the in-memory override for this path."""
+        if path is None:
+            return
+        if img_bgr is None:
+            self._img_override.pop(path, None)
+        else:
+            self._img_override[path] = img_bgr
+
+    def has_override(self, path):
+        return path in self._img_override
+
 
     def current_position(self):
         if not self.has_images():
@@ -93,7 +307,8 @@ class ImageViewerModel:
         self._predictions.clear()
         self._labels.clear()
         for path in self._paths:
-            preds = [random.randint(0, 1) for _ in range(num_circles)]
+            n = len(self._circles.get(path, [])) or num_circles
+            preds = [random.randint(0, 1) for _ in range(n)]
             self._predictions[path] = preds
             self._labels[path] = preds.copy()
 
@@ -136,6 +351,19 @@ class ImageDisplayWidget(QWidget):
         # reference to current labels list (from model), or None
         self.labels = None
         self.circles_visible = False
+        
+        self.edit_mode = False
+        self.selected_idx = None
+        self.on_selection_changed = None  # callback(idx:int|None, r:int|None)
+        self._dragging = False
+        self._drag_offset_img = (0.0, 0.0)  # offset between click point and center in IMAGE coords
+
+        # callback hook set by parent; called when circles change
+        self.on_circles_changed = None
+
+        
+        self.circles_xyz = None  # list of (x,y,r) in IMAGE pixel coords
+
 
         # store last draw rect of the image to map normalized coords -> pixels
         self._last_draw_rect = None
@@ -161,18 +389,86 @@ class ImageDisplayWidget(QWidget):
         )
 
     # ----- public API -----
+    def set_circles_xyz(self, circles_xyz):
+        self.circles_xyz = circles_xyz
+        self.update()
+        
+    def set_edit_mode(self, enabled: bool):
+        self.edit_mode = bool(enabled)
+        self.update()
 
-    def set_image(self, path):
-        if path is None:
+    def _widget_to_image_xy(self, wx, wy):
+        """Map widget pixel coords -> image pixel coords using last draw rect."""
+        if self._last_draw_rect is None or self.pixmap is None:
+            return None
+        rect = self._last_draw_rect
+        img_w = self.pixmap.width()
+        img_h = self.pixmap.height()
+        if img_w <= 0 or img_h <= 0:
+            return None
+
+        scale = min(self.width() / img_w, self.height() / img_h)
+        ix = (wx - rect.x()) / scale
+        iy = (wy - rect.y()) / scale
+        return float(ix), float(iy)
+
+    def _hit_test_circle(self, ix, iy):
+        """Return index of circle containing (ix,iy) in IMAGE coords, else None."""
+        if not self.circles_xyz:
+            return None
+        best = None
+        best_d2 = 1e18
+        for i, (x, y, r) in enumerate(self.circles_xyz):
+            dx = ix - x
+            dy = iy - y
+            d2 = dx * dx + dy * dy
+            if d2 <= (r * r) and d2 < best_d2:
+                best = i
+                best_d2 = d2
+        return best
+
+    def _emit_circles_changed(self):
+        if callable(self.on_circles_changed):
+            self.on_circles_changed(self.circles_xyz or [])
+
+
+    def set_image(self, source):
+        """
+        source can be:
+        - None
+        - str path
+        - np.ndarray (BGR)
+        """
+        if source is None:
             self.pixmap = None
+
+        elif isinstance(source, str):
+            pm = QPixmap(source)
+            self.pixmap = None if pm.isNull() else pm
+
         else:
-            pm = QPixmap(path)
-            if pm.isNull():
+            # assume numpy BGR
+            img_bgr = source
+            if not isinstance(img_bgr, np.ndarray):
                 self.pixmap = None
+                self._last_draw_rect = None
+                self.update()
+                return
+
+            if img_bgr.ndim == 2:
+                img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_GRAY2RGB)
             else:
-                self.pixmap = pm
+                img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+            h, w = img_rgb.shape[:2]
+            img_rgb = np.ascontiguousarray(img_rgb)
+            bytes_per_line = img_rgb.strides[0]
+            qimg = QImage(img_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+            self.pixmap = QPixmap.fromImage(qimg)
+
         self._last_draw_rect = None
         self.update()
+
 
     def set_labels_ref(self, labels):
         """
@@ -228,58 +524,139 @@ class ImageDisplayWidget(QWidget):
         painter.drawPixmap(target_rect, self.pixmap, QRectF(0, 0, img_w, img_h))
 
         # draw circles
-        if self.circles_visible and self.labels is not None:
-            radius = self.circle_radius_norm * min(draw_w, draw_h)
-            for idx, (nx, ny) in enumerate(self.circle_norm_positions):
-                if idx >= len(self.labels):
-                    break
-                cx = offset_x + nx * draw_w
-                cy = offset_y + ny * draw_h
+        # draw circles (detected wells)
+        if self.circles_xyz:
+            # scale from image pixels -> widget pixels
+            for idx, (x, y, r) in enumerate(self.circles_xyz):
+                cx = offset_x + (x * scale)
+                cy = offset_y + (y * scale)
+                rr = r * scale
 
-                value = self.labels[idx]
-                color = QColor(0, 255, 0) if value == 1 else QColor(255, 0, 0)
+                # color logic:
+                # - if labels exist (and have an entry), keep your green/red scheme
+                # - otherwise: blue (requested)
+                # selected circle should be black
+                if self.edit_mode and self.selected_idx == idx:
+                    color = QColor(0, 0, 0)
+                else:
+                    if self.labels is not None and idx < len(self.labels):
+                        value = self.labels[idx]
+                        color = QColor(0, 255, 0) if value == 1 else QColor(255, 0, 0)
+                    else:
+                        color = QColor(0, 0, 255)
 
-                pen = QPen(color, 2)
+                width = 4 if (self.edit_mode and self.selected_idx == idx) else 2
+                pen = QPen(color, width)
                 painter.setPen(pen)
                 painter.setBrush(Qt.NoBrush)
-                painter.drawEllipse(QPointF(cx, cy), radius, radius)
+                painter.drawEllipse(QPointF(cx, cy), rr, rr)
+
+
 
     def mousePressEvent(self, event):
-        if (
-            not self.circles_visible
-            or self.labels is None
-            or self._last_draw_rect is None
-        ):
+        if self._last_draw_rect is None or self.pixmap is None:
             return
 
         pos = event.pos()
-        x = pos.x()
-        y = pos.y()
+        mapped = self._widget_to_image_xy(pos.x(), pos.y())
+        if mapped is None:
+            return
+        ix, iy = mapped
 
-        rect = self._last_draw_rect
-        draw_w = rect.width()
-        draw_h = rect.height()
-        offset_x = rect.x()
-        offset_y = rect.y()
-        radius = self.circle_radius_norm * min(draw_w, draw_h)
-        radius_sq = radius * radius
+        # EDIT MODE: select exactly ONE circle (or deselect)
+        if self.edit_mode and self.circles_xyz:
+            hit = self._hit_test_circle(ix, iy)
 
-        # find circle under click
-        for idx, (nx, ny) in enumerate(self.circle_norm_positions):
-            if idx >= len(self.labels):
-                break
-            cx = offset_x + nx * draw_w
-            cy = offset_y + ny * draw_h
+            # left click: select + start drag (only if hit)
+            if event.button() == Qt.LeftButton:
+                if hit is None:
+                    # click on empty space: deselect
+                    self.selected_idx = None
+                    self._dragging = False
+                    self.update()
+                    return
 
-            dx = x - cx
-            dy = y - cy
-            if dx * dx + dy * dy <= radius_sq:
-                # toggle label 0 <-> 1
-                self.labels[idx] = 1 - self.labels[idx]
+                # select exactly one
+                if self.selected_idx != hit:
+                    self.selected_idx = hit
+                    if callable(self.on_selection_changed):
+                        _, _, rr0 = self.circles_xyz[hit]
+                        self.on_selection_changed(hit, int(rr0))
+                else:
+                    self.selected_idx = hit  # keep as-is
+
+                cx, cy, _ = self.circles_xyz[hit]
+                self._drag_offset_img = (ix - cx, iy - cy)
+                self._dragging = True
                 self.update()
-                break
+                return
 
-        # don't call super().mousePressEvent(event) to keep clicks local
+            # right click: deselect
+            if event.button() == Qt.RightButton:
+                self.selected_idx = None
+                self._dragging = False
+                self.update()
+                return
+
+        # NOT EDITING: label toggling
+        if (
+            not self.edit_mode
+            and self.circles_visible
+            and self.labels is not None
+            and self.circles_xyz
+            and event.button() == Qt.LeftButton
+        ):
+            hit = self._hit_test_circle(ix, iy)
+            if hit is not None and hit < len(self.labels):
+                self.labels[hit] = 1 - self.labels[hit]
+                self.update()
+                return
+
+    def mouseMoveEvent(self, event):
+        if not (self.edit_mode and self._dragging and self.selected_idx is not None and self.circles_xyz):
+            return
+        mapped = self._widget_to_image_xy(event.pos().x(), event.pos().y())
+        if mapped is None:
+            return
+        ix, iy = mapped
+
+        ox, oy = self._drag_offset_img
+        nx = int(round(ix - ox))
+        ny = int(round(iy - oy))
+
+        x, y, r = self.circles_xyz[self.selected_idx]
+        self.circles_xyz[self.selected_idx] = (nx, ny, r)
+
+        # IMPORTANT: don't reorder while dragging (prevents "collecting" others)
+        self.update()
+
+
+    def mouseReleaseEvent(self, event):
+        if self.edit_mode and self._dragging:
+            self._dragging = False
+            self._emit_circles_changed()
+            self.update()
+
+    # def wheelEvent(self, event):
+    #     if not (self.edit_mode and self.selected_idx is not None and self.circles_xyz):
+    #         return
+    #     delta = event.angleDelta().y()
+    #     if delta == 0:
+    #         return
+
+    #     step = 1
+    #     if event.modifiers() & Qt.ShiftModifier:
+    #         step = 3  # faster resize with Shift
+
+    #     dr = step if delta > 0 else -step
+    #     x, y, r = self.circles_xyz[self.selected_idx]
+    #     r2 = int(np.clip(r + dr, 10, 200))
+    #     self.circles_xyz[self.selected_idx] = (x, y, r2)
+    #     # don't reorder immediately; just redraw
+    #     self.update()
+    def wheelEvent(self, event):
+        # disabled: use the radius slider instead
+        return
 
 
 class ImageViewerWidget(QWidget):
@@ -293,6 +670,20 @@ class ImageViewerWidget(QWidget):
 
         # image display
         self.image_display = ImageDisplayWidget()
+        
+        self._last_path = None
+
+        # right-side well size controls
+        self.radius_title = QLabel("Well size")
+        self.radius_title.setStyleSheet("color: #ddd; font-weight: 600;")
+
+        self.radius_value = QLabel("Radius: -")
+        self.radius_value.setStyleSheet("color: #ddd;")
+
+        self.radius_slider = QSlider(Qt.Vertical)
+        self.radius_slider.setRange(10, 200)
+        self.radius_slider.setValue(38)
+        self.radius_slider.setEnabled(False)
 
         # info + navigation
         self.info_label = QLabel("0 / 0")
@@ -327,21 +718,50 @@ class ImageViewerWidget(QWidget):
         nav_layout.addWidget(self.info_label)
         nav_layout.addWidget(self.next_button)
 
-        # ----- new buttons: Predict / Save / Reset -----
+        # ----- new buttons: Rotate / Preprocess / Predict / Save / Reset -----
+        self.rotate_button = QPushButton("Rotate")
+        self.preprocess_button = QPushButton("Preprocess")
         self.predict_button = QPushButton("Predict")
         self.save_button = QPushButton("Save")
         self.reset_button = QPushButton("Reset")
+        self.edit_wells_button = QPushButton("Edit Wells: OFF")
+        self.add_well_button = QPushButton("Add Well")
+        self.delete_well_button = QPushButton("Delete Selected")
 
-        for btn in (self.predict_button, self.save_button, self.reset_button):
+
+
+        for btn in (
+            self.rotate_button, self.preprocess_button,
+            self.edit_wells_button, self.add_well_button, self.delete_well_button,
+            self.predict_button, self.save_button, self.reset_button
+        ):
             btn.setStyleSheet(button_style)
 
+
+
         actions_layout = QHBoxLayout()
+        actions_layout.addWidget(self.rotate_button)
+        actions_layout.addWidget(self.preprocess_button)
+        actions_layout.addWidget(self.edit_wells_button)
+        actions_layout.addWidget(self.add_well_button)
         actions_layout.addWidget(self.predict_button)
+        actions_layout.addWidget(self.delete_well_button)
         actions_layout.addWidget(self.save_button)
         actions_layout.addWidget(self.reset_button)
 
         main_layout = QVBoxLayout()
-        main_layout.addWidget(self.image_display, stretch=1)
+        image_row = QHBoxLayout()
+        image_row.addWidget(self.image_display, stretch=1)
+
+        right_panel = QVBoxLayout()
+        right_panel.addWidget(self.radius_title)
+        right_panel.addWidget(self.radius_value)
+        right_panel.addWidget(self.radius_slider, stretch=1)
+        right_panel.addStretch(1)
+
+        image_row.addLayout(right_panel)
+
+        main_layout.addLayout(image_row, stretch=1)
         main_layout.addLayout(nav_layout)
         main_layout.addLayout(actions_layout)
         self.setLayout(main_layout)
@@ -349,9 +769,39 @@ class ImageViewerWidget(QWidget):
         # connections
         self.prev_button.clicked.connect(self.on_prev_clicked)
         self.next_button.clicked.connect(self.on_next_clicked)
+        
+        self.radius_slider.valueChanged.connect(self.on_radius_slider_changed)
 
         # initial state
         self.update_view()
+        
+    def on_circle_selected(self, idx, r):
+        # enable slider + sync to selected radius
+        self.radius_slider.blockSignals(True)
+        self.radius_slider.setEnabled(True)
+        self.radius_slider.setValue(int(r))
+        self.radius_slider.blockSignals(False)
+        self.radius_value.setText(f"Radius: {int(r)}")
+
+    def on_radius_slider_changed(self, value):
+        # only when editing and a circle is selected
+        if not self.image_display.edit_mode:
+            return
+        idx = self.image_display.selected_idx
+        if idx is None:
+            return
+        if not self.image_display.circles_xyz or idx >= len(self.image_display.circles_xyz):
+            return
+
+        x, y, _r = self.image_display.circles_xyz[idx]
+        self.image_display.circles_xyz[idx] = (int(x), int(y), int(value))
+        self.radius_value.setText(f"Radius: {int(value)}")
+
+        # persist to model (no reordering needed; radius doesn't affect row/col order)
+        path = self.model.current_path()
+        self.model.set_circles(path, list(self.image_display.circles_xyz))
+        self.image_display.update()
+
 
     def on_prev_clicked(self):
         if self.model.go_previous():
@@ -379,7 +829,11 @@ class ImageViewerWidget(QWidget):
             return
 
         path = self.model.current_path()
-        self.image_display.set_image(path)
+        if self.model.has_override(path):
+            self.image_display.set_image(self.model.get_bgr(path))
+        else:
+            self.image_display.set_image(path)
+
 
         current, total = self.model.current_position()
         filename = os.path.basename(path) if path else "N/A"
@@ -391,6 +845,35 @@ class ImageViewerWidget(QWidget):
         # connect labels for current image (if predictions exist)
         labels = self.model.get_labels_for_current()
         self.image_display.set_labels_ref(labels)
+        
+        circles_xyz = self.model.get_circles_for_current()
+        self.image_display.set_circles_xyz(circles_xyz)
+        # selection -> slider
+        self.image_display.on_selection_changed = self.on_circle_selected
+
+        # reset slider when changing images (until a circle is clicked)
+        self.radius_slider.blockSignals(True)
+        self.radius_slider.setEnabled(False)
+        self.radius_value.setText("Radius: -")
+        self.radius_slider.blockSignals(False)
+
+        # Only reset selection when we actually changed to a different image
+        if path != getattr(self, "_last_path", None):
+            self.image_display.selected_idx = None
+            self.image_display._dragging = False
+
+        self._last_path = path
+
+
+        def _on_changed(new_circles):
+            path = self.model.current_path()
+            ordered, labels = enforce_8x10_row_major(new_circles, rows=8, cols=10)
+            self.model.set_circles(path, ordered)
+            self.model.set_well_labels(path, labels)
+            # keep overlay in the enforced order immediately
+            self.image_display.circles_xyz = ordered
+
+        self.image_display.on_circles_changed = _on_changed
 
 
 class MainWindow(QMainWindow):
@@ -409,6 +892,17 @@ class MainWindow(QMainWindow):
 
         # central viewer widget
         self.viewer_widget = ImageViewerWidget(self.model)
+
+        # connect edit-wells UI
+        self.viewer_widget.edit_wells_button.clicked.connect(self.on_toggle_edit_wells)
+        self.viewer_widget.add_well_button.clicked.connect(self.on_add_well_clicked)
+        self.viewer_widget.delete_well_button.clicked.connect(self.on_delete_well_clicked)
+        
+        # preprocess
+        self.viewer_widget.preprocess_button.clicked.connect(self.on_preprocess_clicked)
+        
+        # rotate button
+        self.viewer_widget.rotate_button.clicked.connect(self.on_rotate_ccw_clicked)
 
         # output directory state + label
         self.output_dir = None
@@ -447,6 +941,180 @@ class MainWindow(QMainWindow):
         self.viewer_widget.reset_button.clicked.connect(self.on_reset_clicked)
 
         self.setStyleSheet("QMainWindow { background-color: #333; }")
+
+    def on_delete_well_clicked(self):
+        """
+        Delete the currently selected well (only works in edit mode).
+        Then enforce ordering again.
+        """
+        if not self.model.has_images():
+            return
+
+        if not self.viewer_widget.image_display.edit_mode:
+            QMessageBox.information(self, "Edit mode off", "Turn on 'Edit Wells' first.")
+            return
+
+        idx = self.viewer_widget.image_display.selected_idx
+        if idx is None:
+            QMessageBox.information(self, "No selection", "Click a circle to select it first.")
+            return
+
+        path = self.model.current_path()
+        circles = list(self.model.get_circles_for_current() or [])
+        if idx < 0 or idx >= len(circles):
+            return
+
+        # remove it
+        circles.pop(idx)
+
+        # enforce stable 8x10 order (will keep up to 80; can be fewer after deletion)
+        ordered, labels = enforce_8x10_row_major(circles, rows=8, cols=10)
+        self.model.set_circles(path, ordered)
+        self.model.set_well_labels(path, labels)
+
+        # keep labels list aligned if it exists
+        cur_labels = self.model.get_labels_for_current()
+        if cur_labels is not None:
+            n = len(ordered)
+            self.model._labels[path] = (cur_labels[:n] + [0] * n)[:n]
+
+        # clear selection after delete
+        self.viewer_widget.image_display.selected_idx = None
+        self.viewer_widget.image_display._dragging = False
+
+        self.viewer_widget.update_view()
+
+
+    def on_toggle_edit_wells(self):
+        enabled = not self.viewer_widget.image_display.edit_mode
+        self.viewer_widget.image_display.set_edit_mode(enabled)
+        self.viewer_widget.edit_wells_button.setText(f"Edit Wells: {'ON' if enabled else 'OFF'}")
+
+    def on_add_well_clicked(self):
+        """
+        Add a new well at the center of the view (in IMAGE coords).
+        Then enforce 8x10 ordering.
+        """
+        if not self.model.has_images():
+            return
+        path = self.model.current_path()
+        circles = list(self.model.get_circles_for_current() or [])
+
+        # Need an image to pick a reasonable default center
+        img = self.model.get_bgr(path)
+        if img is None:
+            return
+        H, W = img.shape[:2]
+
+        # default new circle in center; default radius ~ current median or 38
+        if circles:
+            med_r = int(np.median([c[2] for c in circles]))
+        else:
+            med_r = 38
+
+        circles.append((W // 2, H // 2, int(np.clip(med_r, 10, 200))))
+
+        # enforce stable order + store
+        ordered, labels = enforce_8x10_row_major(circles, rows=8, cols=10)
+        self.model.set_circles(path, ordered)
+        self.model.set_well_labels(path, labels)
+
+        # also ensure predictions/labels length matches if already predicted
+        cur_labels = self.model.get_labels_for_current()
+        if cur_labels is not None:
+            # truncate/extend with zeros to match
+            n = len(ordered)
+            if len(cur_labels) != n:
+                new_lab = (cur_labels[:n] + [0] * n)[:n]
+                self.model._labels[path] = new_lab
+
+        self.viewer_widget.update_view()
+
+    def on_rotate_ccw_clicked(self):
+        """
+        Rotate ONLY the currently displayed image by 90° CCW.
+        - No disk writes.
+        - Stores the rotated pixels as an in-memory override for that image path.
+        - Preprocess will automatically use the rotated pixels (see change below).
+        """
+        if not self.model.has_images():
+            QMessageBox.information(self, "No images", "Please open images first.")
+            return
+
+        path = self.model.current_path()
+        img = self.model.get_bgr(path)
+        if img is None:
+            QMessageBox.warning(self, "Rotate failed", f"Could not read image:\n{path}")
+            return
+
+        rotated = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        self.model.set_override(path, rotated)
+
+        self.viewer_widget.update_view()
+
+    def on_preprocess_clicked(self):
+        """
+        Warps all currently loaded images IN MEMORY (no disk writes).
+        Uses current pixels for each image (rotated override if present).
+        Stores warped result as override for each path, so downstream uses warped images.
+        """
+        if not self.model.has_images():
+            QMessageBox.information(self, "No images", "Please open images first.")
+            return
+
+        failures = []
+        for p in list(self.model._paths):
+            img = self.model.get_bgr(p)  # <-- IMPORTANT: reads rotated override if it exists
+            if img is None:
+                failures.append(os.path.basename(p))
+                continue
+
+            warped = extract_plate_warp(img, W=1200, H=800)
+            if warped is None:
+                failures.append(os.path.basename(p))
+                continue
+
+            # store warped pixels as override (no saving)
+            self.model.set_override(p, warped)
+            
+            # detect wells on the WARPED image
+            circles = remove_overlaps(detect_wells(warped), min_dist=REMOVE_OVERLAP_MINDIST)
+            well_map = remove_edge_columns(label_wells_A1_H12(circles))
+            
+            # sanity check: expect 8x12 before dropping edges, and 8x10 after
+            full_map = label_wells_A1_H12(circles)
+            if len(full_map) < 96:
+                print(f"[WARN] {os.path.basename(p)}: only {len(full_map)} wells labeled (expected 96).")
+            well_map = remove_edge_columns(full_map)
+            if len(well_map) != 80:
+                print(f"[WARN] {os.path.basename(p)}: after dropping edges got {len(well_map)} wells (expected 80).")
+
+
+            # enforce stable row-major order: A2..A11, B2..B11, ..., H2..H11
+            ordered_labels = []
+            circles_xyz = []
+            for row in "ABCDEFGH":
+                for col in range(2, 12):  # 2..11 (drop 1 and 12)
+                    key = f"{row}{col}"
+                    if key in well_map:
+                        ordered_labels.append(key)
+                        circles_xyz.append(well_map[key])
+
+            self.model.set_circles(p, circles_xyz)
+            self.model.set_well_labels(p, ordered_labels)
+
+
+        self.viewer_widget.update_view()
+
+        if failures:
+            QMessageBox.warning(
+                self,
+                "Some images failed",
+                "These images could not be preprocessed:\n" + "\n".join(failures[:20]) +
+                ("\n..." if len(failures) > 20 else "")
+            )
+
+
 
     def _create_toolbar(self):
         toolbar = QToolBar("Main Toolbar")
