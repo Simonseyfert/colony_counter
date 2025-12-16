@@ -96,7 +96,7 @@ Note: When the excel file is opened, the save function might not work
 
 19. Oh yeah and there is an undo and redo button. They may not work everytime you hope they would work, I didn't check all possible events - apologies here
 
-## Repository Structure (Preliminary)
+## Repository Structure
 
 ```text
 colony_counter/
