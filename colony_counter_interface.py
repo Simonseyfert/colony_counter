@@ -206,6 +206,8 @@ class ImageViewerModel:
         self._img_override = {}  # path -> np.ndarray (BGR) for modified images (rotated/warped)
         self._circles = {}  # path -> list[(x,y,r)] in IMAGE pixel coords
         self._well_labels = {}  # path -> list[str] (e.g., ["A2","A3",...,"H11"])
+        self._undo = {}  # path -> list of snapshots
+        self._redo = {}  # path -> list of snapshots
 
 
     def set_images(self, paths):
@@ -217,6 +219,57 @@ class ImageViewerModel:
         self._img_override.clear()
         self._circles.clear()
         self._well_labels.clear()
+        self._undo.clear()
+        self._redo.clear()
+
+    def push_history(self, path):
+        if path is None:
+            return
+        snap = {
+            "circles": list(self._circles.get(path, [])),
+            "labels": (self._labels.get(path) or []).copy() if path in self._labels else None,
+            "well_labels": list(self._well_labels.get(path, [])),
+        }
+        self._undo.setdefault(path, []).append(snap)
+        self._redo[path] = []
+
+    def can_undo(self, path): return bool(self._undo.get(path))
+    def can_redo(self, path): return bool(self._redo.get(path))
+
+    def undo(self, path):
+        if not self.can_undo(path): return False
+        cur = {
+            "circles": list(self._circles.get(path, [])),
+            "labels": (self._labels.get(path) or []).copy() if path in self._labels else None,
+            "well_labels": list(self._well_labels.get(path, [])),
+        }
+        snap = self._undo[path].pop()
+        self._redo.setdefault(path, []).append(cur)
+        self._circles[path] = snap["circles"]
+        self._well_labels[path] = snap["well_labels"]
+        if snap["labels"] is None:
+            self._labels.pop(path, None)
+        else:
+            self._labels[path] = snap["labels"]
+        return True
+
+    def redo(self, path):
+        if not self.can_redo(path): return False
+        cur = {
+            "circles": list(self._circles.get(path, [])),
+            "labels": (self._labels.get(path) or []).copy() if path in self._labels else None,
+            "well_labels": list(self._well_labels.get(path, [])),
+        }
+        snap = self._redo[path].pop()
+        self._undo.setdefault(path, []).append(cur)
+        self._circles[path] = snap["circles"]
+        self._well_labels[path] = snap["well_labels"]
+        if snap["labels"] is None:
+            self._labels.pop(path, None)
+        else:
+            self._labels[path] = snap["labels"]
+        return True
+
         
     def set_well_labels(self, path, labels):
         if path is None:
@@ -361,7 +414,8 @@ class ImageDisplayWidget(QWidget):
         # callback hook set by parent; called when circles change
         self.on_circles_changed = None
 
-        
+        self._last_released_center = None
+
         self.circles_xyz = None  # list of (x,y,r) in IMAGE pixel coords
 
 
@@ -389,6 +443,17 @@ class ImageDisplayWidget(QWidget):
         )
 
     # ----- public API -----
+    
+    def _nearest_circle_index(self, ix, iy):
+        if not self.circles_xyz:
+            return None
+        best_i, best_d2 = None, 1e18
+        for i, (x, y, _r) in enumerate(self.circles_xyz):
+            d2 = (ix - x) ** 2 + (iy - y) ** 2
+            if d2 < best_d2:
+                best_i, best_d2 = i, d2
+        return best_i
+
     def set_circles_xyz(self, circles_xyz):
         self.circles_xyz = circles_xyz
         self.update()
@@ -634,6 +699,13 @@ class ImageDisplayWidget(QWidget):
     def mouseReleaseEvent(self, event):
         if self.edit_mode and self._dragging:
             self._dragging = False
+
+            # remember where the selected circle ended up (image coords)
+            self._last_released_center = None
+            if self.selected_idx is not None and self.circles_xyz and self.selected_idx < len(self.circles_xyz):
+                x, y, _r = self.circles_xyz[self.selected_idx]
+                self._last_released_center = (int(x), int(y))
+
             self._emit_circles_changed()
             self.update()
 
@@ -680,8 +752,8 @@ class ImageViewerWidget(QWidget):
         self.radius_value = QLabel("Radius: -")
         self.radius_value.setStyleSheet("color: #ddd;")
 
-        self.radius_slider = QSlider(Qt.Vertical)
-        self.radius_slider.setRange(10, 200)
+        self.radius_slider = QSlider(Qt.Horizontal)
+        self.radius_slider.setRange(10, 100)
         self.radius_slider.setValue(38)
         self.radius_slider.setEnabled(False)
 
@@ -728,6 +800,14 @@ class ImageViewerWidget(QWidget):
         self.add_well_button = QPushButton("Add Well")
         self.delete_well_button = QPushButton("Delete Selected")
 
+        self.undo_button = QPushButton("Undo")
+        self.redo_button = QPushButton("Redo")
+        self.undo_button.setStyleSheet(button_style)
+        self.redo_button.setStyleSheet(button_style)
+        self.undo_button.setEnabled(False)
+        self.redo_button.setEnabled(False)
+        
+
 
 
         for btn in (
@@ -742,10 +822,10 @@ class ImageViewerWidget(QWidget):
         actions_layout = QHBoxLayout()
         actions_layout.addWidget(self.rotate_button)
         actions_layout.addWidget(self.preprocess_button)
-        actions_layout.addWidget(self.edit_wells_button)
-        actions_layout.addWidget(self.add_well_button)
+        # actions_layout.addWidget(self.edit_wells_button)
+        # actions_layout.addWidget(self.add_well_button)
         actions_layout.addWidget(self.predict_button)
-        actions_layout.addWidget(self.delete_well_button)
+        # actions_layout.addWidget(self.delete_well_button)
         actions_layout.addWidget(self.save_button)
         actions_layout.addWidget(self.reset_button)
 
@@ -757,7 +837,19 @@ class ImageViewerWidget(QWidget):
         right_panel.addWidget(self.radius_title)
         right_panel.addWidget(self.radius_value)
         right_panel.addWidget(self.radius_slider, stretch=1)
+        
+        right_panel.addWidget(self.undo_button)
+        right_panel.addWidget(self.redo_button)
+
+
+        # editing controls on the right
+        right_panel.addSpacing(10)
+        right_panel.addWidget(self.edit_wells_button)
+        right_panel.addWidget(self.add_well_button)
+        right_panel.addWidget(self.delete_well_button)
+
         right_panel.addStretch(1)
+
 
         image_row.addLayout(right_panel)
 
@@ -863,15 +955,34 @@ class ImageViewerWidget(QWidget):
             self.image_display._dragging = False
 
         self._last_path = path
+        path = self.model.current_path()
+        self.undo_button.setEnabled(self.model.can_undo(path))
+        self.redo_button.setEnabled(self.model.can_redo(path))
 
 
         def _on_changed(new_circles):
             path = self.model.current_path()
+
+            # preserve selection by released position (not by index)
+            keep_xy = getattr(self.image_display, "_last_released_center", None)
+
             ordered, labels = enforce_8x10_row_major(new_circles, rows=8, cols=10)
             self.model.set_circles(path, ordered)
             self.model.set_well_labels(path, labels)
-            # keep overlay in the enforced order immediately
+
             self.image_display.circles_xyz = ordered
+
+            # re-select the same circle after reordering
+            if keep_xy is not None:
+                kx, ky = keep_xy
+                new_idx = self.image_display._nearest_circle_index(kx, ky)
+                self.image_display.selected_idx = new_idx
+
+                # update slider to match newly selected circle
+                if new_idx is not None and new_idx < len(ordered):
+                    _x, _y, rr = ordered[new_idx]
+                    self.on_circle_selected(new_idx, int(rr))
+
 
         self.image_display.on_circles_changed = _on_changed
 
@@ -897,6 +1008,9 @@ class MainWindow(QMainWindow):
         self.viewer_widget.edit_wells_button.clicked.connect(self.on_toggle_edit_wells)
         self.viewer_widget.add_well_button.clicked.connect(self.on_add_well_clicked)
         self.viewer_widget.delete_well_button.clicked.connect(self.on_delete_well_clicked)
+        self.viewer_widget.undo_button.clicked.connect(self.on_undo)
+        self.viewer_widget.redo_button.clicked.connect(self.on_redo)
+
         
         # preprocess
         self.viewer_widget.preprocess_button.clicked.connect(self.on_preprocess_clicked)
@@ -942,6 +1056,24 @@ class MainWindow(QMainWindow):
 
         self.setStyleSheet("QMainWindow { background-color: #333; }")
 
+    def on_undo(self):
+        path = self.model.current_path()
+        if self.model.undo(path):
+            self.viewer_widget.update_view()
+
+    def on_redo(self):
+        path = self.model.current_path()
+        if self.model.redo(path):
+            self.viewer_widget.update_view()
+    def keyPressEvent(self, event):
+        if event.modifiers() & Qt.ControlModifier and event.key() == Qt.Key_Z:
+            self.on_undo()
+            return
+        if event.modifiers() & Qt.ControlModifier and event.key() == Qt.Key_Y:
+            self.on_redo()
+            return
+        super().keyPressEvent(event)
+
     def on_delete_well_clicked(self):
         """
         Delete the currently selected well (only works in edit mode).
@@ -963,6 +1095,11 @@ class MainWindow(QMainWindow):
         circles = list(self.model.get_circles_for_current() or [])
         if idx < 0 or idx >= len(circles):
             return
+        
+        path = self.model.current_path()
+
+        # ⬅️ push history BEFORE deletion
+        self.model.push_history(path)
 
         # remove it
         circles.pop(idx)
@@ -1012,7 +1149,13 @@ class MainWindow(QMainWindow):
         else:
             med_r = 38
 
-        circles.append((W // 2, H // 2, int(np.clip(med_r, 10, 200))))
+        path = self.model.current_path()
+
+        # ⬅️ push history BEFORE modification
+        self.model.push_history(path)
+
+        circles.append((W // 2, H // 2, med_r))
+
 
         # enforce stable order + store
         ordered, labels = enforce_8x10_row_major(circles, rows=8, cols=10)
@@ -1029,6 +1172,19 @@ class MainWindow(QMainWindow):
                 self.model._labels[path] = new_lab
 
         self.viewer_widget.update_view()
+        # select the newly added circle (closest to image center)
+        path = self.model.current_path()
+        img = self.model.get_bgr(path)
+        if img is not None:
+            H, W = img.shape[:2]
+            circles = self.model.get_circles_for_current()
+            if circles:
+                i = self.viewer_widget.image_display._nearest_circle_index(W // 2, H // 2)
+                self.viewer_widget.image_display.selected_idx = i
+                if i is not None:
+                    _x, _y, rr = circles[i]
+                    self.viewer_widget.on_circle_selected(i, int(rr))
+
 
     def on_rotate_ccw_clicked(self):
         """
