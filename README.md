@@ -19,7 +19,7 @@ For questions or issues, feel free to contact:
 
 ## How to install
 1. Click on the latest release
-![Overview Github](image-1.png)
+![Overview Github](data/images_readme/image-1.png)
 
 ## How to run
 
