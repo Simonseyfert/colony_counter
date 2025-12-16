@@ -478,6 +478,7 @@ class ImageDisplayWidget(QWidget):
         self.edit_mode = False
         self.selected_idx = None
         self.on_selection_changed = None  # callback(idx:int|None, r:int|None)
+        self.on_labels_changed = None  # callback() when labels are edited (non-edit mode clicks)
         self._dragging = False
         self._drag_offset_img = (0.0, 0.0)  # offset between click point and center in IMAGE coords
 
@@ -752,12 +753,17 @@ class ImageDisplayWidget(QWidget):
             if hit is not None and hit < len(self.labels):
                 cur = self.labels[hit]
                 if cur == 2:
-                    # first manual resolve: set to "dead" (1). Next click toggles normally.
                     self.labels[hit] = 1
                 else:
                     self.labels[hit] = 1 - cur
+
+                # notify parent so row counts can refresh immediately
+                if callable(self.on_labels_changed):
+                    self.on_labels_changed()
+
                 self.update()
                 return
+
 
     def mouseMoveEvent(self, event):
         if not (self.edit_mode and self._dragging and self.selected_idx is not None and self.circles_xyz):
@@ -826,6 +832,18 @@ class ImageViewerWidget(QWidget):
         self.image_display = ImageDisplayWidget()
         
         self._last_path = None
+        
+        # --- row-wise dead counts (A..H) ---
+        self.row_count_title = QLabel("Dead count")
+        self.row_count_title.setStyleSheet("color: #ddd; font-weight: 600; margin-top: 6px;")
+
+        self.row_count_labels = []
+        for row in "ABCDEFGH":
+            lab = QLabel(f"{row}: —")
+            lab.setStyleSheet("color: #ddd;")
+            lab.setFixedWidth(70)
+            self.row_count_labels.append(lab)
+
 
         # right-side well size controls
         self.radius_title = QLabel("Well size")
@@ -877,7 +895,7 @@ class ImageViewerWidget(QWidget):
         self.preprocess_button = QPushButton("Preprocess")
         self.predict_button = QPushButton("Predict")
         self.save_button = QPushButton("Save")
-        self.reset_button = QPushButton("Reset")
+        self.toggle_orange_button = QPushButton("Resolve orange: OFF")
         self.edit_wells_button = QPushButton("Edit Wells: OFF")
         self.add_well_button = QPushButton("Add Well")
         self.delete_well_button = QPushButton("Delete Selected")
@@ -895,7 +913,7 @@ class ImageViewerWidget(QWidget):
         for btn in (
             self.rotate_button, self.preprocess_button,
             self.edit_wells_button, self.add_well_button, self.delete_well_button,
-            self.predict_button, self.save_button, self.reset_button
+            self.predict_button, self.toggle_orange_button, self.save_button
         ):
             btn.setStyleSheet(button_style)
 
@@ -909,31 +927,41 @@ class ImageViewerWidget(QWidget):
         actions_layout.addWidget(self.predict_button)
         # actions_layout.addWidget(self.delete_well_button)
         actions_layout.addWidget(self.save_button)
-        actions_layout.addWidget(self.reset_button)
+        actions_layout.addWidget(self.toggle_orange_button)
+        # actions_layout.addWidget(self.reset_button)
 
         main_layout = QVBoxLayout()
         image_row = QHBoxLayout()
+
+        # LEFT: row counts
+        left_panel = QVBoxLayout()
+        left_panel.addWidget(self.row_count_title)
+        for lab in self.row_count_labels:
+            left_panel.addWidget(lab)
+        left_panel.addStretch(1)
+
+        image_row.addLayout(left_panel)                 # <- left of image
         image_row.addWidget(self.image_display, stretch=1)
 
+        # RIGHT: controls
         right_panel = QVBoxLayout()
         right_panel.addWidget(self.radius_title)
         right_panel.addWidget(self.radius_value)
-        right_panel.addWidget(self.radius_slider, stretch=1)
-        
+        right_panel.addWidget(self.radius_slider)       # <- IMPORTANT: no stretch here
+
+        right_panel.addSpacing(8)
         right_panel.addWidget(self.undo_button)
         right_panel.addWidget(self.redo_button)
 
-
-        # editing controls on the right
-        right_panel.addSpacing(10)
+        right_panel.addSpacing(8)
         right_panel.addWidget(self.edit_wells_button)
         right_panel.addWidget(self.add_well_button)
         right_panel.addWidget(self.delete_well_button)
 
         right_panel.addStretch(1)
 
-
         image_row.addLayout(right_panel)
+
 
         main_layout.addLayout(image_row, stretch=1)
         main_layout.addLayout(nav_layout)
@@ -988,6 +1016,34 @@ class ImageViewerWidget(QWidget):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.image_display.update()
+        
+    def update_row_counts(self):
+        """
+        Show per-row count of dead wells (label==1) ONLY if no uncertain (label==2) remain.
+        Otherwise show '—' for all rows.
+        Assumes 8x10 ordering.
+        """
+        labels = self.model.get_labels_for_current()
+        rows, cols = 8, 10
+
+        # default: hide counts
+        if labels is None or len(labels) != rows * cols:
+            for i, row in enumerate("ABCDEFGH"):
+                self.row_count_labels[i].setText(f"{row}: —")
+            return
+
+        # only show counts if ALL yellows resolved
+        if any(v == 2 for v in labels):
+            for i, row in enumerate("ABCDEFGH"):
+                self.row_count_labels[i].setText(f"{row}: —")
+            return
+
+        # compute counts
+        for ri, row in enumerate("ABCDEFGH"):
+            row_vals = labels[ri * cols:(ri + 1) * cols]
+            dead = sum(1 for v in row_vals if v == 1)
+            self.row_count_labels[ri].setText(f"{row}: {dead}")
+
 
     def update_view(self):
         """
@@ -1022,6 +1078,12 @@ class ImageViewerWidget(QWidget):
         
         circles_xyz = self.model.get_circles_for_current()
         self.image_display.set_circles_xyz(circles_xyz)
+        # update row counters for this image
+        self.update_row_counts()
+
+        # refresh row counters when user manually toggles labels
+        self.image_display.on_labels_changed = self.update_row_counts
+
         # selection -> slider
         self.image_display.on_selection_changed = self.on_circle_selected
 
@@ -1083,6 +1145,8 @@ class MainWindow(QMainWindow):
         # model
         self.model = ImageViewerModel()
 
+        self.resolve_orange = False
+
         # central viewer widget
         self.viewer_widget = ImageViewerWidget(self.model)
 
@@ -1092,7 +1156,7 @@ class MainWindow(QMainWindow):
         self.viewer_widget.delete_well_button.clicked.connect(self.on_delete_well_clicked)
         self.viewer_widget.undo_button.clicked.connect(self.on_undo)
         self.viewer_widget.redo_button.clicked.connect(self.on_redo)
-
+        self.viewer_widget.toggle_orange_button.clicked.connect(self.on_toggle_orange)
         
         # preprocess
         self.viewer_widget.preprocess_button.clicked.connect(self.on_preprocess_clicked)
@@ -1134,9 +1198,70 @@ class MainWindow(QMainWindow):
         # connect Predict / Save / Reset buttons
         self.viewer_widget.predict_button.clicked.connect(self.on_predict_clicked)
         self.viewer_widget.save_button.clicked.connect(self.on_save_clicked)
-        self.viewer_widget.reset_button.clicked.connect(self.on_reset_clicked)
+        # self.viewer_widget.reset_button.clicked.connect(self.on_reset_clicked)
 
         self.setStyleSheet("QMainWindow { background-color: #333; }")
+
+    def apply_orange_policy_current_image(self):
+        path = self.model.current_path()
+        if path is None:
+            return
+
+        labels = self.model.get_labels_for_current()
+        probas = self.model.get_probas_for_path(path)
+
+        if labels is None or probas is None or len(labels) != len(probas):
+            return  # nothing to update yet
+
+        new_labels = list(labels)
+        for i, (lab, p) in enumerate(zip(labels, probas)):
+            if lab != 2:
+                continue  # only care about orange ones
+
+            if p is None:
+                print(f"[ORANGE #{i}] p=None (oversaturated / invalid crop)")
+                continue
+
+            conf = max(p, 1.0 - p)
+            print(f"[ORANGE #{i}] p={p:.4f}, conf={conf:.4f}, resolve_orange={self.resolve_orange}")
+
+            if self.resolve_orange:
+                new_labels[i] = 1 if p >= 0.5 else 0
+            else:
+                if conf < UNCERTAINTY_CONF_THRESH:
+                    new_labels[i] = 2
+                else:
+                    new_labels[i] = 1 if p >= 0.5 else 0
+
+        # for i, (lab, p) in enumerate(zip(labels, probas)):
+        #     if p is None:
+        #         # oversaturated / no model proba -> stay orange unless user resolves manually
+        #         continue
+
+        #     conf = max(p, 1.0 - p)
+
+        #     if self.resolve_orange:
+        #         # resolve low-confidence ones too
+        #         new_labels[i] = 1 if p >= 0.5 else 0
+        #     else:
+        #         # restore Lina behavior: mark low-confidence as orange
+        #         if conf < UNCERTAINTY_CONF_THRESH:
+        #             new_labels[i] = 2
+        #         else:
+        #             new_labels[i] = 1 if p >= 0.5 else 0
+
+        self.model.set_predictions_for_path(path, new_labels, probas)
+
+
+    def on_toggle_orange(self):
+        self.resolve_orange = not self.resolve_orange
+        self.viewer_widget.toggle_orange_button.setText(
+            f"Resolve orange: {'ON' if self.resolve_orange else 'OFF'}"
+        )
+
+        # NEW: immediately apply to current image using stored probabilities
+        self.apply_orange_policy_current_image()
+        self.viewer_widget.update_view()
 
     def on_undo(self):
         path = self.model.current_path()
@@ -1515,10 +1640,11 @@ class MainWindow(QMainWindow):
             probas_out[idx] = p
             conf = max(p, 1.0 - p)
 
-            if conf < UNCERTAINTY_CONF_THRESH:
+            if conf < UNCERTAINTY_CONF_THRESH and (not self.resolve_orange):
                 labels_out[idx] = 2
             else:
                 labels_out[idx] = 1 if p >= 0.5 else 0
+
 
         self.model.set_predictions_for_path(path, labels_out, probas_out)
         self.viewer_widget.update_view()
