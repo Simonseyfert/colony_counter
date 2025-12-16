@@ -1,6 +1,8 @@
 import sys
 import os
 import random
+import joblib
+
 
 from PyQt5.QtWidgets import (
     QApplication,
@@ -189,6 +191,60 @@ def enforce_8x10_row_major(circles_xyz, rows=8, cols=10):
             labels.append(f"{row}{col}")
     return ordered, labels[: len(ordered)]
 
+# ============================================================
+# MODEL INFERENCE HELPERS (copied from Lina's logic)
+# ============================================================
+
+# Oversaturation thresholds (same as Lina)
+HOT_PIXEL_THRESH, CHANNEL_THRESH = 0.10, 240
+
+# Uncertainty threshold (same as Lina)
+UNCERTAINTY_CONF_THRESH = 0.70
+
+def crop_well(img_bgr, x, y, r, size=64):
+    """Crop the smallest rectangle that encloses the circle and resize to (size,size)."""
+    h, w = img_bgr.shape[:2]
+    x1 = max(int(x - r), 0); x2 = min(int(x + r), w)
+    y1 = max(int(y - r), 0); y2 = min(int(y + r), h)
+    patch = img_bgr[y1:y2, x1:x2]
+    if patch.size == 0:
+        return None
+    return cv2.resize(patch, (size, size), interpolation=cv2.INTER_AREA)
+
+def is_oversaturated(crop_bgr):
+    hot = (
+        (crop_bgr[:, :, 0] > CHANNEL_THRESH) |
+        (crop_bgr[:, :, 1] > CHANNEL_THRESH) |
+        (crop_bgr[:, :, 2] > CHANNEL_THRESH)
+    )
+    return float(np.mean(hot)) > HOT_PIXEL_THRESH
+
+def extract_full_features(crop_bgr):
+    lab = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2LAB)
+    hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+    return np.array([
+        float(lab[:, :, 0].mean()), float(lab[:, :, 1].mean()), float(lab[:, :, 2].mean()),
+        float(hsv[:, :, 0].mean()), float(hsv[:, :, 1].mean()), float(hsv[:, :, 2].mean()),
+        float(np.var(gray))
+    ], dtype=float)
+
+def proba_class1(model, X):
+    """
+    Return probability for class=1 (same robust logic as Lina).
+    Your class 1 = "dead".
+    """
+    if hasattr(model, "predict_proba"):
+        proba = model.predict_proba(X)
+        # pick column corresponding to class 1 robustly
+        if hasattr(model, "classes_"):
+            classes = model.classes_
+            if 1 in classes:
+                idx = int(np.where(classes == 1)[0][0])
+                return proba[:, idx]
+        return proba[:, 1]
+    # fallback: no proba available
+    return None
 
 
 class ImageViewerModel:
@@ -208,6 +264,7 @@ class ImageViewerModel:
         self._well_labels = {}  # path -> list[str] (e.g., ["A2","A3",...,"H11"])
         self._undo = {}  # path -> list of snapshots
         self._redo = {}  # path -> list of snapshots
+        self._probas = {}       # path -> list[float or None] aligned with circles
 
 
     def set_images(self, paths):
@@ -221,6 +278,19 @@ class ImageViewerModel:
         self._well_labels.clear()
         self._undo.clear()
         self._redo.clear()
+        self._probas.clear()
+        
+    def set_predictions_for_path(self, path, labels, probas=None):
+        if path is None:
+            return
+        self._predictions[path] = list(labels) if labels is not None else None
+        self._labels[path] = list(labels) if labels is not None else None
+        if probas is not None:
+            self._probas[path] = list(probas)
+
+    def get_probas_for_path(self, path):
+        return self._probas.get(path)
+
 
     def push_history(self, path):
         if path is None:
@@ -606,7 +676,14 @@ class ImageDisplayWidget(QWidget):
                 else:
                     if self.labels is not None and idx < len(self.labels):
                         value = self.labels[idx]
-                        color = QColor(0, 255, 0) if value == 1 else QColor(255, 0, 0)
+                        # 0 = alive -> green, 1 = dead -> red, 2 = uncertain -> yellow
+                        if value == 2:
+                            color = QColor(255, 215, 0)  # yellow/orange
+                        elif value == 1:
+                            color = QColor(255, 0, 0)    # red
+                        else:
+                            color = QColor(0, 255, 0)    # green
+
                     else:
                         color = QColor(0, 0, 255)
 
@@ -673,7 +750,12 @@ class ImageDisplayWidget(QWidget):
         ):
             hit = self._hit_test_circle(ix, iy)
             if hit is not None and hit < len(self.labels):
-                self.labels[hit] = 1 - self.labels[hit]
+                cur = self.labels[hit]
+                if cur == 2:
+                    # first manual resolve: set to "dead" (1). Next click toggles normally.
+                    self.labels[hit] = 1
+                else:
+                    self.labels[hit] = 1 - cur
                 self.update()
                 return
 
@@ -1352,15 +1434,95 @@ class MainWindow(QMainWindow):
 
     def on_predict_clicked(self):
         """
-        Simulate model predictions: generate random labels for ALL images.
-        Then update current view so circles appear.
+        Run the saved sklearn pipeline (MLP) on the CURRENT image wells.
+        Produces:
+        label 0 = alive (green)
+        label 1 = dead  (red)
+        label 2 = uncertain (yellow) if:
+            - oversaturated crop OR
+            - confidence < UNCERTAINTY_CONF_THRESH
         """
         if not self.model.has_images():
             QMessageBox.information(self, "No images", "Please open images first.")
             return
 
-        self.model.generate_random_predictions_for_all(NUM_CIRCLES)
+        path = self.model.current_path()
+        if path is None:
+            return
+
+        circles = self.model.get_circles_for_path(path)
+        if not circles or len(circles) == 0:
+            QMessageBox.warning(self, "No wells", "No wells detected yet. Click Preprocess first.")
+            return
+
+        # load model (joblib) from same folder as this script
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        model_path = os.path.join(script_dir, "best_model_robust_aug.joblib")
+        if not os.path.exists(model_path):
+            QMessageBox.warning(
+                self,
+                "Missing model",
+                f"Could not find best_model.joblib next to the script:\n{model_path}"
+            )
+            return
+
+        try:
+            model = joblib.load(model_path)
+        except Exception as e:
+            QMessageBox.critical(self, "Model load failed", str(e))
+            return
+
+        img = self.model.get_bgr(path)
+        if img is None:
+            QMessageBox.critical(self, "Image read failed", "Could not read current image pixels.")
+            return
+
+        # Build crops/features in the CURRENT circle order (this respects any user reordering!)
+        feats = []
+        feat_indices = []
+        labels_out = [2] * len(circles)     # default uncertain
+        probas_out = [None] * len(circles)  # optional storage
+
+        for i, (x, y, r) in enumerate(circles):
+            crop = crop_well(img, x, y, r, size=64)
+            if crop is None:
+                labels_out[i] = 2
+                continue
+
+            if is_oversaturated(crop):
+                labels_out[i] = 2
+                continue
+
+            feats.append(extract_full_features(crop))
+            feat_indices.append(i)
+
+        if len(feats) == 0:
+            # everything uncertain
+            self.model.set_predictions_for_path(path, labels_out, probas_out)
+            self.viewer_widget.update_view()
+            return
+
+        X = np.vstack(feats).astype(float)
+        p1 = proba_class1(model, X)
+
+        if p1 is None:
+            QMessageBox.warning(self, "No probabilities", "Model does not provide predict_proba.")
+            return
+
+        # apply Lina confidence threshold
+        for j, idx in enumerate(feat_indices):
+            p = float(p1[j])
+            probas_out[idx] = p
+            conf = max(p, 1.0 - p)
+
+            if conf < UNCERTAINTY_CONF_THRESH:
+                labels_out[idx] = 2
+            else:
+                labels_out[idx] = 1 if p >= 0.5 else 0
+
+        self.model.set_predictions_for_path(path, labels_out, probas_out)
         self.viewer_widget.update_view()
+
 
     def on_reset_clicked(self):
         """
