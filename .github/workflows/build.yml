@@ -34,7 +34,7 @@ jobs:
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            pip install pyqt5 pandas openpyxl
+            pip install pyqt5 pandas openpyxl opencv-python numpy scipy scikit-learn joblib
           fi
           pip install pyinstaller
 
@@ -43,6 +43,12 @@ jobs:
         run: |
           pyinstaller --noconfirm --clean --windowed --onefile \
             --name ColonyCounter colony_counter_interface.py
+            
+      - name: Bundle model next to executable
+        shell: bash
+        run: |
+          test -f best_model_robust_aug.joblib || (echo "Missing best_model_robust_aug.joblib in repo root" && ls -ლა && exit 1)
+          cp best_model_robust_aug.joblib dist/
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
@@ -69,6 +75,11 @@ jobs:
           if [ -d "dist/ColonyCounter.app" ]; then
             ditto -c -k --sequesterRsrc --keepParent \
               "dist/ColonyCounter.app" "release/ColonyCounter-macos.app.zip"
+          fi
+
+          # Model file (needed at runtime)
+          if [ -f "best_model_robust_aug.joblib" ]; then
+            cp "best_model_robust_aug.joblib" "release/best_model_robust_aug.joblib"
           fi
 
       - name: Upload assets to GitHub Release
