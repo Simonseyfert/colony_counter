@@ -1,22 +1,22 @@
-et_xmlfile==2.0.0
-joblib @ file:///home/conda/feedstock_root/build_artifacts/joblib_1765794027227/work
-numpy @ file:///D:/bld/numpy_1747544591878/work/dist/numpy-2.2.6-cp310-cp310-win_amd64.whl#sha256=af66576ce916c795ffa81be9620c8138a3fda6e1713b2bf7775a630e47eca3a8
+# Core runtime
+numpy==2.2.6
+scipy==1.15.2
+joblib==1.5.3
+scikit-learn==1.7.2
+threadpoolctl==3.6.0
+
+# Image / UI
 opencv-python==4.12.0
-opencv-python-headless==4.12.0
-openpyxl==3.1.5
-pandas==2.3.3
-pillow==12.0.0
 PyQt5==5.15.11
-PyQt5-Qt5==5.15.2
-PyQt5_sip==12.17.1
-PySide6==6.10.0
-PySide6_Addons==6.10.0
-PySide6_Essentials==6.10.0
+pillow==12.0.0
+
+# Excel export
+pandas==2.3.3
+openpyxl==3.1.5
+et-xmlfile==2.0.0
+
+# Time deps used by pandas
 python-dateutil==2.9.0.post0
 pytz==2025.2
-scikit-learn @ file:///D:/bld/scikit-learn_1757432814257/work/dist/scikit_learn-1.7.2-cp310-cp310-win_amd64.whl#sha256=80780e7bac7c11947bc8f76f74cce4a729277e8fc2c67f76db5038e95de040c9
-scipy @ file:///C:/bld/scipy-split_1739790833536/work/dist/scipy-1.15.2-cp310-cp310-win_amd64.whl#sha256=4748853a0c723cda1fa2bdead847ba7c2443bde9cec3436e3e7243cfa54b55ff
-shiboken6==6.10.0
-six==1.17.0
-threadpoolctl @ file:///home/conda/feedstock_root/build_artifacts/threadpoolctl_1741878222898/work
 tzdata==2025.2
+six==1.17.0
