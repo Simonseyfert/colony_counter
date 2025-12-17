@@ -65,7 +65,7 @@ Note: all prediction steps have to be done for each image (that includes clickin
 
 11. Explanation Overview:
 Red = Infected (label 1), green = not infected (label 0), orange/yellow = model is unsure
-Note: The prediction does not always work as intended. Note only orange/yellow cells might be wrong!
+Note: The prediction does not always work as intended. Not only orange/yellow cells might be wrong!
 ![predicted_view](data/images_readme/predicted_view.png)
 
 12. Now the user can automatically resolve the orange cases by clicking on "Resolve orange: OFF". This shows what the model thinks is more likely. As soon as the ambigious cases are resolved, the count per row is displayed
